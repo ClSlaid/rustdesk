@@ -11,11 +11,18 @@ use serde_derive::{Deserialize, Serialize};
 use std::{
     boxed::Box,
     ffi::{CStr, CString},
-    sync::{Arc, Mutex, RwLock},
+    sync::{atomic::AtomicI32, Arc, Mutex, RwLock},
 };
 
+/// generic RDP Clipboard Virtual Channel Extension implement
+pub mod client_context;
+/// abstracted clipboard PDU
+pub mod clipboard_file;
 pub mod cliprdr;
 pub mod context_send;
+/// system specific clipboard implementation
+pub mod system_impl;
+
 pub use context_send::*;
 
 const ERR_CODE_SERVER_FUNCTION_NONE: u32 = 0x00000001;
@@ -69,8 +76,8 @@ struct MsgChannel {
 
 lazy_static::lazy_static! {
     static ref VEC_MSG_CHANNEL: RwLock<Vec<MsgChannel>> = Default::default();
-    static ref CLIENT_CONN_ID_COUNTER: Mutex<i32> = Mutex::new(0);
 }
+static CLIENT_CONN_ID_COUNTER: AtomicI32 = AtomicI32::new(0);
 
 impl ClipboardFile {
     pub fn is_stopping_allowed(&self) -> bool {
@@ -99,12 +106,19 @@ pub fn get_client_conn_id(session_uuid: &SessionID) -> Option<i32> {
         .map(|x| x.conn_id)
 }
 
-fn get_conn_id() -> i32 {
-    let mut lock = CLIENT_CONN_ID_COUNTER.lock().unwrap();
-    *lock += 1;
-    *lock
+/// Generate virtual channel id for new connection
+/// # NOTE:
+/// - the connection counter will wrap around on overflow, but this should be ok.
+/// - this happens to equal to IPC connection ID, further study required.
+fn gen_conn_id() -> i32 {
+    use std::sync::atomic::Ordering;
+    CLIENT_CONN_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Extract virtual channel connection id and clipboard file receiver on current session
+///
+/// # NOTE:
+/// - nil UUID may have corresponding connection ID
 pub fn get_rx_cliprdr_client(
     session_uuid: &SessionID,
 ) -> (i32, Arc<TokioMutex<UnboundedReceiver<ClipboardFile>>>) {
@@ -118,7 +132,7 @@ pub fn get_rx_cliprdr_client(
             let (sender, receiver) = unbounded_channel();
             let receiver = Arc::new(TokioMutex::new(receiver));
             let receiver2 = receiver.clone();
-            let conn_id = get_conn_id();
+            let conn_id = gen_conn_id();
             let msg_channel = MsgChannel {
                 session_uuid: session_uuid.to_owned(),
                 conn_id,
@@ -131,6 +145,7 @@ pub fn get_rx_cliprdr_client(
     }
 }
 
+/// Extract clipboard file receiver on this virtual channel
 pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<ClipboardFile>>> {
     let mut lock = VEC_MSG_CHANNEL.write().unwrap();
     match lock.iter().find(|x| x.conn_id == conn_id) {
@@ -164,6 +179,7 @@ fn send_data(conn_id: i32, data: ClipboardFile) {
     }
 }
 
+/// TODO: make it rust style
 pub fn empty_clipboard(context: &mut CliprdrClientContext, conn_id: i32) -> bool {
     unsafe { TRUE == cliprdr::empty_cliprdr(context, conn_id as u32) }
 }
